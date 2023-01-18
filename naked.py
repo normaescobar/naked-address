@@ -29,12 +29,7 @@ ASSET_TX_URLS = {
     'ALGO' : 'https://algoexplorer.io/tx/',
     'XRP' : 'https://xrpscan.com/tx/',
     'XLM' : 'https://stellarchain.io/transactions/',
-    'ETH' : 'https://etherscan.io/tx/',
-    'ETC' : 'https://etcblockexplorer.com/tx/',
-    'MATIC' : 'https://etherscan.io/tx/',
-    'FTM' : 'https://etherscan.io/tx/',
-    'AVAX': 'https://etherscan.io/tx/'
-    
+    'ETC' : 'https://etcblockexplorer.com/tx/'
 }
 
 def set_verified_tx(work_sheet, row, column, value):
@@ -188,95 +183,81 @@ def process_algorand(asset, asset_symbol, asset_decimal, address, start_date, en
         rows = content['transactions']
         next_token = content['next-token'] if 'next-token' in content else None
         if len(rows) < 1:
-            break
+            break   
 
-def get_eth_vin_value(address, tx_data, vin):
-    if address.upper() in [*map(lambda x:x.upper(), vin['addresses'])]:
-        return Decimal(tx_data['value']) + Decimal(tx_data['fees'])  
-    return 0
-    
-def get_eth_vout_value(address, vout):
-    if address.upper() in [*map(lambda x:x.upper(), vout['addresses'])]:
-        return Decimal(vout['value'])
-    return 0    
 
+def get_eth_block(api_link):
+    tx = requests.get(api_link)
+    content = json.loads(tx.content)
+    return int(content['result'][0]['blockNumber'])
 
 def process_ethereum(asset, asset_symbol, asset_decimal, address, start_date, end_date, output):
-    api_link = 'https://ethblockexplorer.org/api/'
+    api_key = 'XQBQNA7X7Z8BU41N9DZ5WUGT5E7YSFF15M'
+    api_link = f'https://api.etherscan.io/api?module=account&address={address}&apikey={api_key}'
+    
+    eth_tx_url = 'https://etherscan.io/tx/'
+    address = address.lower()
     
     work_sheet = set_worksheet(output, asset)
     work_sheet.append(['Date', 'Block Index', 'Transaction ID', 'Sent', 'Received', 'Asset', 'Blockchain URL']) 
     
-    page_count = get_blockexplorer_pagecount(api_link, address, ['unconfirmedTxs', 'txs', 'nonTokenTxs'])
-    for page in range(1, page_count+1):
-        try:
-            addr_link = f'{api_link}address/{address}?page={page}'
-            addr = requests.get(addr_link, headers=HEADERS)
-            if addr.status_code != 200:
-                return  
-            content = json.loads(addr.content)
-        except requests.exceptions.ChunkedEncodingError:
-            work_sheet.append(['api error'])
-            continue            
-        
-        txs = content['txids']
-        
-        for tx in txs:
-            tx_link = f'{api_link}tx/{tx}'
-            try:
-                tx = requests.get(tx_link, headers=HEADERS)  
-                if tx.status_code != 200:
-                    return   
-                tx_data = json.loads(tx.content)
-            except requests.exceptions.ChunkedEncodingError:
-                work_sheet.append(['api error'])
-                continue
+    start_block = get_eth_block(f'{api_link}&action=txlist&startblock=0&endblock=99999999&sort=asc&offset=1&page=1')
+    end_block = get_eth_block(f'{api_link}&action=txlist&startblock=0&endblock=99999999&sort=desc&offset=1&page=1')
+    
+    block_increment = 100000
+    while start_block <= end_block:
+        print(f'Working on blocks {start_block}-{start_block + block_increment}')
+        api_txlist = f'{api_link}&action=txlist&startblock={start_block}&endblock={start_block + block_increment}&sort=asc'
+        api_tokentx = f'{api_link}&action=tokentx&startblock={start_block}&endblock={start_block + block_increment}&sort=asc'
 
-            date = tx_data['blockTime'] 
-            
-            if date < start_date:
+        tx_list = requests.get(api_txlist)
+        content = json.loads(tx_list.content)
+        rows = content['result']
+        for row in rows:
+            timestamp = int(row['timeStamp'])
+            if timestamp < start_date:
+                continue
+            if timestamp > end_date:
                 break
+                
+            value = Decimal(row['value'])
+            if value > 0:
+                value /= Decimal(asset_decimal)
+                sent = 0
+                received = 0
+                if address == row['from']:
+                    sent = value
+                elif address == row['to']:
+                    received = value
                     
-            if date > end_date:
+                work_sheet.append([str(datetime.fromtimestamp(timestamp)), row['blockNumber'], row['hash'], sent, received, asset_symbol, ''])
+                set_verified_tx(work_sheet, work_sheet.max_row, 6, f'{eth_tx_url}{row["hash"]}')
+
+        token_tx = requests.get(api_tokentx)
+        content = json.loads(token_tx.content)
+        rows = content['result']
+        for row in rows:
+            token_symbol = row['tokenSymbol']
+        
+            timestamp = int(row['timeStamp'])
+            if timestamp < start_date:
                 continue
+            if timestamp > end_date:
+                break
                 
-            received = 0
+            value = Decimal(row['value']) / Decimal(10 ** int(row['tokenDecimal']))
             sent = 0
-            
-            for vin in tx_data['vin']:
-                sent += get_eth_vin_value(address, tx_data, vin)
-
-            for vout in tx_data['vout']:              
-                received += get_eth_vout_value(address, vout)
-                
-
-            symbol = asset_symbol
-            dec = Decimal(asset_decimal)
-            
-            if sent == 0 and received == 0 and 'tokenTransfers' in tx_data:
-                tokenTransfer = tx_data['tokenTransfers'][0]
-                tokenSymbol = tokenTransfer['symbol']
-                
-                if tokenSymbol in ('AVAX', 'FTM', 'MATIC'):
-                    symbol = tokenSymbol
-                    dec = Decimal(10 ** int(tokenTransfer['decimals']))
-                else:
-                    continue
+            received = 0
+            if address == row['from']:
+                sent = value
+            elif address == row['to']:
+                received = value
                     
-                if tx_data['vin'][0]['addresses'][0] == tokenTransfer['from']:
-                    sent = Decimal(tokenTransfer['value'])
-                else:
-                    received = Decimal(tokenTransfer['value'])
-                            
-            if received:
-                received = received/dec
-            
-            if sent:
-                sent = sent/dec
-
-            work_sheet.append([str(datetime.fromtimestamp(date)), tx_data['blockHeight'], tx_data['txid'], sent, received, symbol, ''])
-            set_verified_tx(work_sheet, work_sheet.max_row, 6, f'{ASSET_TX_URLS[symbol]}{tx_data["txid"]}')                   
-            
+            work_sheet.append([str(datetime.fromtimestamp(timestamp)), row['blockNumber'], row['hash'], sent, received, token_symbol, ''])
+            set_verified_tx(work_sheet, work_sheet.max_row, 6, f'{eth_tx_url}{row["hash"]}')
+        
+        start_block += block_increment + 1
+        
                 
 def process_blockchair_asset(asset, asset_symbol, asset_decimal, api_keyword, address, start_date, end_date, output):
     start_date = datetime.fromtimestamp(start_date).strftime('%Y-%m-%d')
@@ -321,12 +302,12 @@ def process_address(asset, address, start_date, end_date, output):
         process_blockchair_asset(asset, 'ZEC', 1e8, 'zcash', address, start_date, end_date, output)
     elif asset.lower() == 'algorand':
         process_algorand(asset, 'ALGO', 1e6, address, start_date, end_date, output)
-    elif asset.lower() == 'ripple':
-        process_ripple(asset, 'XRP', 1e6, address, start_date, end_date, output)
+    # elif asset.lower() == 'ripple':
+        # process_ripple(asset, 'XRP', 1e6, address, start_date, end_date, output)
     #elif asset.lower() == 'stellar':
     #    process_stellar(asset, 'XLM', 1, address, start_date, end_date, output)
-    #elif asset.lower() == 'ethereum':
-    #    process_ethereum(asset, 'ETH', 1e18, address, start_date, end_date, output)
+    if asset.lower() == 'ethereum':
+       process_ethereum(asset, 'ETH', 1e18, address, start_date, end_date, output)
     
 
 
